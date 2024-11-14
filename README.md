@@ -1,6 +1,6 @@
 # gonetwork
 
-KISS (Keep It Simple, Stupid) networking written in Go.
+KISS (Keep It Simple, Stupid) and ACID (Atomicity, Consistency, Isolation, Durability) networking written in Go.
 
 ## Current protocols
 
