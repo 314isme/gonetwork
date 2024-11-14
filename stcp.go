@@ -7,93 +7,57 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
+
+	"google.golang.org/protobuf/proto"
 )
 
-type STcp struct {
+type TCPServer struct {
 	config      ServerConfig
-	tcpListener net.Listener
+	listener    net.Listener
 	connections sync.Map
-	acceptorWG  sync.WaitGroup
-	handlerWG   sync.WaitGroup
-	taskChan    chan net.Conn
-	connPool    *ConnPool
+	wg          sync.WaitGroup
 }
 
-type TCPConnectionEntry struct {
-	Conn net.Conn
+func STCPNew(config ServerConfig) *TCPServer {
+	return &TCPServer{config: config}
 }
 
-func TCPNewS(config ServerConfig) *STcp {
-	server := &STcp{
-		config:   config,
-		taskChan: make(chan net.Conn, config.MaxWorkers),
-		connPool: NewConnPool(config.MaxWorkers, 5*time.Second),
-	}
-	server.startWorkers()
-	return server
-}
-
-func (s *STcp) startWorkers() {
-	for i := 0; i < s.config.MaxWorkers; i++ {
-		s.handlerWG.Add(1)
-		go s.worker()
-	}
-}
-
-func (s *STcp) Listen(ctx context.Context) error {
-	var err error
-	var cert tls.Certificate
+func (s *TCPServer) Listen(ctx context.Context) error {
 	address := s.config.Address + ":" + s.config.TCPPort
+	var err error
 	if s.config.Secure {
-		cert, err = TLSCert(s.config.CertFile, s.config.KeyFile)
-		if err != nil {
-			return err
-		}
-		tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-		s.tcpListener, err = tls.Listen("tcp", address, tlsConfig)
+		cert, _ := tls.LoadX509KeyPair(s.config.CertFile, s.config.KeyFile)
+		tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+		s.listener, err = tls.Listen("tcp", address, tlsConfig)
 	} else {
-		s.tcpListener, err = net.Listen("tcp", address)
+		s.listener, err = net.Listen("tcp", address)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to start TCP listener: %v", err)
 	}
-	s.acceptorWG.Add(1)
+
+	s.wg.Add(1)
 	go s.acceptConnections(ctx)
 	return nil
 }
 
-func (s *STcp) acceptConnections(ctx context.Context) {
-	defer s.acceptorWG.Done()
+func (s *TCPServer) acceptConnections(_ context.Context) {
+	defer s.wg.Done()
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			conn, err := s.tcpListener.Accept()
-			if err != nil {
-				continue
-			}
-			s.taskChan <- conn
-			connID := conn.RemoteAddr().String()
-			if s.config.OnConnected != nil {
-				s.config.OnConnected(connID)
-			}
+		conn, err := s.listener.Accept()
+		if err != nil {
+			continue
 		}
+		connID := conn.RemoteAddr().String()
+		s.connections.Store(connID, conn)
+		if s.config.OnConnected != nil {
+			s.config.OnConnected(connID)
+		}
+		go s.handleClient(connID, conn)
 	}
 }
 
-func (s *STcp) worker() {
-	defer s.handlerWG.Done()
-	for conn := range s.taskChan {
-		s.handleClient(conn)
-	}
-}
-
-func (s *STcp) handleClient(conn net.Conn) {
-	connID := conn.RemoteAddr().String()
-	entry := TCPConnectionEntry{Conn: conn}
-	s.connections.Store(connID, entry)
+func (s *TCPServer) handleClient(connID string, conn net.Conn) {
 	defer func() {
 		conn.Close()
 		s.connections.Delete(connID)
@@ -101,9 +65,10 @@ func (s *STcp) handleClient(conn net.Conn) {
 			s.config.OnDisconnected(connID)
 		}
 	}()
+
 	for {
 		var length uint32
-		if err := binary.Read(conn, binary.BigEndian, &length); err != nil || length > 1024*1024 {
+		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
 			return
 		}
 		data := make([]byte, length)
@@ -116,54 +81,45 @@ func (s *STcp) handleClient(conn net.Conn) {
 	}
 }
 
-func (s *STcp) Send(connectionID string, data []byte) {
-	value, ok := s.connections.Load(connectionID)
-	if !ok {
-		return
+func (s *TCPServer) Send(connectionID, dataHandler, dataType string, data proto.Message) error {
+	dataByte, err := EncodeMessage(dataHandler, dataType, data)
+	if err != nil {
+		return err
 	}
-	entry := value.(TCPConnectionEntry)
-	length := uint32(len(data))
-	if err := binary.Write(entry.Conn, binary.BigEndian, length); err != nil {
-		return
-	}
-	entry.Conn.Write(data)
-}
-
-func (s *STcp) Broadcast(data []byte, except ...map[string]bool) {
-	s.connections.Range(func(key, value interface{}) bool {
-		connID := key.(string)
-		if len(except) > 0 && except[0][connID] {
-			return true
-		}
-		s.Send(connID, data)
-		return true
-	})
-}
-
-func (s *STcp) IsConnection(connectionID string) bool {
-	_, ok := s.connections.Load(connectionID)
-	return ok
-}
-
-func (s *STcp) GetConnection(connectionID string) net.Conn {
-	value, ok := s.connections.Load(connectionID)
-	if !ok {
+	if conn, ok := s.connections.Load(connectionID); ok {
+		length := uint32(len(dataByte))
+		binary.Write(conn.(net.Conn), binary.BigEndian, length)
+		conn.(net.Conn).Write(dataByte)
 		return nil
 	}
-	return value.(TCPConnectionEntry).Conn
+	return fmt.Errorf("connection ID not found")
 }
 
-func (s *STcp) Shutdown() {
-	if s.tcpListener != nil {
-		s.tcpListener.Close()
+func (s *TCPServer) Broadcast(dataHandler, dataType string, data proto.Message) {
+	dataByte, err := EncodeMessage(dataHandler, dataType, data)
+	if err != nil {
+		return
 	}
-	s.acceptorWG.Wait()
-	close(s.taskChan)
-	s.handlerWG.Wait()
-	s.connections.Range(func(key, value interface{}) bool {
-		conn := value.(TCPConnectionEntry).Conn
-		conn.Close()
+	s.connections.Range(func(_, conn interface{}) bool {
+		length := uint32(len(dataByte))
+		binary.Write(conn.(net.Conn), binary.BigEndian, length)
+		conn.(net.Conn).Write(dataByte)
 		return true
 	})
-	s.connPool.CloseAll()
+}
+
+func (s *TCPServer) Disconnect(connectionID string) {
+	if conn, ok := s.connections.Load(connectionID); ok {
+		conn.(net.Conn).Close()
+		s.connections.Delete(connectionID)
+	}
+}
+
+func (s *TCPServer) Shutdown() {
+	s.listener.Close()
+	s.wg.Wait()
+	s.connections.Range(func(_, conn interface{}) bool {
+		conn.(net.Conn).Close()
+		return true
+	})
 }

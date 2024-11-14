@@ -3,51 +3,39 @@ package gonetwork
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/coder/websocket"
+	"google.golang.org/protobuf/proto"
 )
 
-type SWs struct {
+type WebSocketServer struct {
 	config      ServerConfig
 	httpServer  *http.Server
 	connections sync.Map
-	handlerWG   sync.WaitGroup
 }
 
-type WSConnectionEntry struct {
-	Conn *websocket.Conn
-}
-
-func WSNewS(config ServerConfig) *SWs {
-	server := &SWs{
-		config: config,
-	}
+func SWSNew(config ServerConfig) *WebSocketServer {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", server.handleConnections)
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if config.Secure {
-		cert, err := TLSCert(config.CertFile, config.KeyFile)
-		if err == nil {
-			tlsConfig.Certificates = []tls.Certificate{cert}
-		}
+	server := &WebSocketServer{
+		config: config,
+		httpServer: &http.Server{
+			Addr:    config.Address + ":" + config.WSPort,
+			Handler: mux,
+		},
 	}
-	server.httpServer = &http.Server{
-		Addr:      config.Address + ":" + config.WSPort,
-		TLSConfig: tlsConfig,
-		Handler:   mux,
-	}
+	mux.HandleFunc("/", server.handleConnection)
 	return server
 }
 
-func (s *SWs) Listen(ctx context.Context) error {
-	s.handlerWG.Add(1)
+func (s *WebSocketServer) Listen(ctx context.Context) error {
 	go func() {
-		defer s.handlerWG.Done()
 		if s.config.Secure {
+			cert, _ := tls.LoadX509KeyPair(s.config.CertFile, s.config.KeyFile)
+			s.httpServer.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 			s.httpServer.ListenAndServeTLS("", "")
 		} else {
 			s.httpServer.ListenAndServe()
@@ -56,40 +44,31 @@ func (s *SWs) Listen(ctx context.Context) error {
 	return nil
 }
 
-func (s *SWs) handleConnections(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: s.config.AllowedOrigins,
-	})
+func (s *WebSocketServer) handleConnection(w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: s.config.AllowedOrigins})
 	if err != nil {
-		log.Printf("failed to accept websocket connection: %v", err)
+		log.Printf("failed to accept WebSocket connection: %v", err)
 		return
 	}
 	connID := r.RemoteAddr
-	entry := WSConnectionEntry{Conn: conn}
-	s.connections.Store(connID, entry)
+	s.connections.Store(connID, conn)
 	if s.config.OnConnected != nil {
 		s.config.OnConnected(connID)
 	}
-	s.handlerWG.Add(1)
-	go s.handleClient(connID)
+	go s.handleClient(connID, conn)
 }
 
-func (s *SWs) handleClient(connID string) {
-	defer s.handlerWG.Done()
-	entry, ok := s.connections.Load(connID)
-	if !ok {
-		return
-	}
-	connEntry := entry.(WSConnectionEntry)
+func (s *WebSocketServer) handleClient(connID string, conn *websocket.Conn) {
 	defer func() {
-		connEntry.Conn.Close(websocket.StatusNormalClosure, "")
+		conn.Close(websocket.StatusNormalClosure, "")
 		s.connections.Delete(connID)
 		if s.config.OnDisconnected != nil {
 			s.config.OnDisconnected(connID)
 		}
 	}()
+
 	for {
-		_, data, err := connEntry.Conn.Read(context.Background())
+		_, data, err := conn.Read(context.Background())
 		if err != nil {
 			return
 		}
@@ -99,49 +78,40 @@ func (s *SWs) handleClient(connID string) {
 	}
 }
 
-func (s *SWs) Send(connectionID string, data []byte) {
-	value, ok := s.connections.Load(connectionID)
-	if !ok {
-		return
+func (s *WebSocketServer) Send(connectionID, dataHandler, dataType string, data proto.Message) error {
+	dataByte, err := EncodeMessage(dataHandler, dataType, data)
+	if err != nil {
+		return err
 	}
-	entry := value.(WSConnectionEntry)
-	entry.Conn.Write(context.Background(), websocket.MessageBinary, data)
+	if conn, ok := s.connections.Load(connectionID); ok {
+		conn.(*websocket.Conn).Write(context.Background(), websocket.MessageBinary, dataByte)
+		return nil
+	}
+	return fmt.Errorf("connection ID not found")
 }
 
-func (s *SWs) Broadcast(data []byte, except ...map[string]bool) {
-	s.connections.Range(func(key, value interface{}) bool {
-		connID := key.(string)
-		if len(except) > 0 && except[0][connID] {
-			return true
-		}
-		s.Send(connID, data)
+func (s *WebSocketServer) Broadcast(dataHandler, dataType string, data proto.Message) {
+	dataByte, err := EncodeMessage(dataHandler, dataType, data)
+	if err != nil {
+		return
+	}
+	s.connections.Range(func(_, conn interface{}) bool {
+		conn.(*websocket.Conn).Write(context.Background(), websocket.MessageBinary, dataByte)
 		return true
 	})
 }
 
-func (s *SWs) IsConnection(connectionID string) bool {
-	_, ok := s.connections.Load(connectionID)
-	return ok
+func (s *WebSocketServer) Disconnect(connectionID string) {
+	if conn, ok := s.connections.Load(connectionID); ok {
+		conn.(*websocket.Conn).Close(websocket.StatusNormalClosure, "")
+		s.connections.Delete(connectionID)
+	}
 }
 
-func (s *SWs) GetConnection(connectionID string) *websocket.Conn {
-	value, ok := s.connections.Load(connectionID)
-	if !ok {
-		return nil
-	}
-	return value.(WSConnectionEntry).Conn
-}
-
-func (s *SWs) Shutdown() {
-	if s.httpServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		s.httpServer.Shutdown(ctx)
-	}
-	s.handlerWG.Wait()
-	s.connections.Range(func(key, value interface{}) bool {
-		conn := value.(WSConnectionEntry).Conn
-		conn.Close(websocket.StatusNormalClosure, "")
+func (s *WebSocketServer) Shutdown() {
+	s.httpServer.Shutdown(context.Background())
+	s.connections.Range(func(_, conn interface{}) bool {
+		conn.(*websocket.Conn).Close(websocket.StatusNormalClosure, "")
 		return true
 	})
 }

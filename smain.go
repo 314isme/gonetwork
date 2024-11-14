@@ -7,71 +7,73 @@ import (
 )
 
 type Server struct {
-	config    ServerConfig
-	tcpServer *STcp
-	wsServer  *SWs
-	ctx       context.Context
-	cancel    context.CancelFunc
+	config  ServerConfig
+	tcpServ ServerConnection
+	wsServ  ServerConnection
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 func NewServer(config ServerConfig) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
+	var tcpServ, wsServ ServerConnection
+	if config.TCPPort != "" {
+		tcpServ = STCPNew(config)
+	}
+	if config.WSPort != "" {
+		wsServ = SWSNew(config)
+	}
 	return &Server{
-		config:    config,
-		tcpServer: TCPNewS(config),
-		wsServer:  WSNewS(config),
-		ctx:       ctx,
-		cancel:    cancel,
+		config:  config,
+		tcpServ: tcpServ,
+		wsServ:  wsServ,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
 func (s *Server) Listen() {
-	if s.config.TCPPort != "" {
-		go s.tcpServer.Listen(s.ctx)
+	if s.tcpServ != nil {
+		go s.tcpServ.Listen(s.ctx)
 	}
-	if s.config.WSPort != "" {
-		go s.wsServer.Listen(s.ctx)
-	}
-}
-
-func (s *Server) Broadcast(dataHandler, dataType string, data proto.Message, except ...map[string]bool) {
-	dataByte, err := Encode(dataHandler, dataType, data)
-	if err != nil {
-		return
-	}
-	if s.config.TCPPort != "" {
-		s.tcpServer.Broadcast(dataByte, except...)
-	}
-	if s.config.WSPort != "" {
-		s.wsServer.Broadcast(dataByte, except...)
+	if s.wsServ != nil {
+		go s.wsServ.Listen(s.ctx)
 	}
 }
 
-func (s *Server) Send(connectionID string, dataHandler, dataType string, data proto.Message) {
-	dataByte, err := Encode(dataHandler, dataType, data)
-	if err != nil {
-		return
+func (s *Server) Broadcast(dataHandler, dataType string, data proto.Message) {
+	if s.tcpServ != nil {
+		s.tcpServ.Broadcast(dataHandler, dataType, data)
 	}
-	if s.config.TCPPort != "" && s.tcpServer.IsConnection(connectionID) {
-		s.tcpServer.Send(connectionID, dataByte)
-	}
-	if s.config.WSPort != "" && s.wsServer.IsConnection(connectionID) {
-		s.wsServer.Send(connectionID, dataByte)
+	if s.wsServ != nil {
+		s.wsServ.Broadcast(dataHandler, dataType, data)
 	}
 }
 
-func (s *Server) GetConnection(connectionID string) interface{} {
-	if s.config.TCPPort != "" && s.tcpServer.IsConnection(connectionID) {
-		return s.tcpServer.GetConnection(connectionID)
+func (s *Server) Send(connectionID, dataHandler, dataType string, data proto.Message) {
+	if s.tcpServ != nil {
+		s.tcpServ.Send(connectionID, dataHandler, dataType, data)
 	}
-	if s.config.WSPort != "" && s.wsServer.IsConnection(connectionID) {
-		return s.wsServer.GetConnection(connectionID)
+	if s.wsServ != nil {
+		s.wsServ.Send(connectionID, dataHandler, dataType, data)
 	}
-	return nil
+}
+
+func (s *Server) Disconnect(connectionID string) {
+	if s.tcpServ != nil {
+		s.tcpServ.Disconnect(connectionID)
+	}
+	if s.wsServ != nil {
+		s.wsServ.Disconnect(connectionID)
+	}
 }
 
 func (s *Server) Shutdown() {
 	s.cancel()
-	s.tcpServer.Shutdown()
-	s.wsServer.Shutdown()
+	if s.tcpServ != nil {
+		s.tcpServ.Shutdown()
+	}
+	if s.wsServ != nil {
+		s.wsServ.Shutdown()
+	}
 }

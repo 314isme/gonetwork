@@ -1,6 +1,7 @@
 package gonetwork
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -65,7 +66,7 @@ func (p *ConnPool) Get() (net.Conn, error) {
 	if p.active < p.maxConns {
 		conn, err := net.DialTimeout("tcp", "server_address", p.timeout)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("connection error: %v", err)
 		}
 		p.active++
 		return conn, nil
@@ -73,23 +74,21 @@ func (p *ConnPool) Get() (net.Conn, error) {
 	return nil, errors.New("no available connections")
 }
 
-func (p *ConnPool) Put(conn net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.idle = append(p.idle, conn)
+type ClientConnection interface {
+	Connect() error
+	Send(data []byte) error
+	Disconnect()
 }
 
-func (p *ConnPool) CloseAll() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, conn := range p.idle {
-		conn.Close()
-	}
-	p.idle = nil
-	p.active = 0
+type ServerConnection interface {
+	Listen(ctx context.Context) error
+	Broadcast(dataHandler, dataType string, data proto.Message)
+	Send(connectionID string, dataHandler, dataType string, data proto.Message) error
+	Disconnect(connectionID string)
+	Shutdown()
 }
 
-func Encode(dataHandler, dataType string, dataProto proto.Message) ([]byte, error) {
+func EncodeMessage(dataHandler, dataType string, dataProto proto.Message) ([]byte, error) {
 	protoBytes, err := proto.Marshal(dataProto)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal data: %v", err)

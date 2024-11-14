@@ -8,59 +8,44 @@ import (
 )
 
 type Client struct {
-	config    ClientConfig
-	tcpClient *CTcp
-	wsClient  *CWs
-	ctx       context.Context
-	cancel    context.CancelFunc
+	config ClientConfig
+	conn   ClientConnection
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewClient(config ClientConfig) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &Client{
-		config: config,
-		ctx:    ctx,
-		cancel: cancel,
-	}
+	var conn ClientConnection
 	switch config.Type {
 	case "TCP":
-		client.tcpClient = TCPNewC(config, ctx, cancel)
+		conn = CTCPNew(config, ctx, cancel)
 	case "WS":
-		client.wsClient = WSNewC(config, ctx, cancel)
+		conn = CWSNew(config, ctx, cancel)
 	default:
 		cancel()
 		return nil
 	}
-	return client
+	return &Client{
+		config: config,
+		conn:   conn,
+		ctx:    ctx,
+		cancel: cancel,
+	}
 }
 
-func (c *Client) Send(dataHandler string, dataType string, dataProto proto.Message) error {
-	dataByte, err := Encode(dataHandler, dataType, dataProto)
+func (c *Client) Send(dataHandler, dataType string, dataProto proto.Message) error {
+	dataByte, err := EncodeMessage(dataHandler, dataType, dataProto)
 	if err != nil {
 		return fmt.Errorf("send error: %v", err)
 	}
-	if c.config.Type == "TCP" {
-		return c.tcpClient.Send(dataByte)
-	} else if c.config.Type == "WS" {
-		return c.wsClient.Send(dataByte)
-	}
-	return nil
+	return c.conn.Send(dataByte)
 }
 
 func (c *Client) Connect() error {
-	if c.config.Type == "TCP" {
-		return c.tcpClient.Connect()
-	} else if c.config.Type == "WS" {
-		return c.wsClient.Connect()
-	}
-	return nil
+	return c.conn.Connect()
 }
 
 func (c *Client) Disconnect() {
-	if c.tcpClient != nil {
-		c.tcpClient.Disconnect()
-	}
-	if c.wsClient != nil {
-		c.wsClient.Disconnect()
-	}
+	c.conn.Disconnect()
 }

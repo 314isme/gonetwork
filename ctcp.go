@@ -6,25 +6,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"sync"
 )
 
 type CTcp struct {
-	config      ClientConfig
-	connection  net.Conn
-	stopChannel chan struct{}
-	ctx         context.Context
-	cancel      context.CancelFunc
-	once        sync.Once
+	config     ClientConfig
+	connection net.Conn
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-func TCPNewC(config ClientConfig, ctx context.Context, cancel context.CancelFunc) *CTcp {
-	return &CTcp{
-		config:      config,
-		stopChannel: make(chan struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
-	}
+func CTCPNew(config ClientConfig, ctx context.Context, cancel context.CancelFunc) *CTcp {
+	return &CTcp{config: config, ctx: ctx, cancel: cancel}
 }
 
 func (c *CTcp) Connect() error {
@@ -48,8 +40,29 @@ func (c *CTcp) Connect() error {
 	return nil
 }
 
+func (c *CTcp) Send(data []byte) error {
+	length := uint32(len(data))
+	if err := binary.Write(c.connection, binary.BigEndian, length); err != nil {
+		c.Disconnect()
+		return fmt.Errorf("failed to write data length: %v", err)
+	}
+	if _, err := c.connection.Write(data); err != nil {
+		c.Disconnect()
+		return fmt.Errorf("failed to write data: %v", err)
+	}
+	return nil
+}
+
+func (c *CTcp) Disconnect() {
+	c.cancel()
+	if c.connection != nil {
+		c.connection.Close()
+		c.connection = nil
+	}
+}
+
 func (c *CTcp) readLoop() {
-	defer c.Close()
+	defer c.Disconnect()
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -57,9 +70,6 @@ func (c *CTcp) readLoop() {
 		default:
 			var length uint32
 			if err := binary.Read(c.connection, binary.BigEndian, &length); err != nil {
-				return
-			}
-			if length > 1024*1024 {
 				return
 			}
 			data := make([]byte, length)
@@ -71,32 +81,4 @@ func (c *CTcp) readLoop() {
 			}
 		}
 	}
-}
-
-func (c *CTcp) Send(data []byte) error {
-	length := uint32(len(data))
-	if err := binary.Write(c.connection, binary.BigEndian, length); err != nil {
-		return fmt.Errorf("failed to write data length: %v", err)
-	}
-	if _, err := c.connection.Write(data); err != nil {
-		return fmt.Errorf("failed to write data: %v", err)
-	}
-	return nil
-}
-
-func (c *CTcp) Disconnect() {
-	c.cancel()
-	c.Close()
-}
-
-func (c *CTcp) Close() error {
-	var err error
-	c.once.Do(func() {
-		close(c.stopChannel)
-		if c.connection != nil {
-			err = c.connection.Close()
-			c.connection = nil
-		}
-	})
-	return err
 }
